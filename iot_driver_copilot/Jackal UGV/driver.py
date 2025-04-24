@@ -1,160 +1,179 @@
 import os
 import threading
-import queue
 import time
+import queue
+from flask import Flask, request, jsonify, Response
 import json
-from flask import Flask, request, Response, jsonify
+
 import rospy
 from geometry_msgs.msg import Twist
+from std_msgs.msg import Header
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, NavSatFix
 from jackal_msgs.msg import Drive, Feedback, Status
-from std_msgs.msg import Header
 
-# --- Environment Variable Config ---
-ROS_MASTER_URI = os.environ.get('ROS_MASTER_URI', 'http://localhost:11311')
-ROS_HOSTNAME = os.environ.get('ROS_HOSTNAME', 'localhost')
-ROS_IP = os.environ.get('ROS_IP', '127.0.0.1')
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
+# ==== Configuration from environment ====
+ROS_MASTER_URI = os.environ.get("ROS_MASTER_URI", "http://localhost:11311")
+ROS_IP = os.environ.get("ROS_IP", "127.0.0.1")
 
-# --- ROS Node Initialization (in a background thread to avoid blocking Flask) ---
-os.environ['ROS_MASTER_URI'] = ROS_MASTER_URI
-os.environ['ROS_HOSTNAME'] = ROS_HOSTNAME
-os.environ['ROS_IP'] = ROS_IP
+HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
+HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
+
+# Topics
+ODOM_TOPIC = os.environ.get("ODOM_TOPIC", "/odometry/filtered")
+IMU_TOPIC = os.environ.get("IMU_TOPIC", "/imu/data")
+NAVSAT_FIX_TOPIC = os.environ.get("NAVSAT_FIX_TOPIC", "/navsat/fix")
+NAVSAT_VEL_TOPIC = os.environ.get("NAVSAT_VEL_TOPIC", "/navsat/vel")
+FEEDBACK_TOPIC = os.environ.get("FEEDBACK_TOPIC", "/feed_back")
+STATUS_TOPIC = os.environ.get("STATUS_TOPIC", "/status")
+CMD_VEL_TOPIC = os.environ.get("CMD_VEL_TOPIC", "/cmd_vel")
+CMD_DRIVER_TOPIC = os.environ.get("CMD_DRIVER_TOPIC", "/cmd_driver")
+
+# ==== ROS Node Setup ====
+os.environ["ROS_MASTER_URI"] = ROS_MASTER_URI
+os.environ["ROS_IP"] = ROS_IP
 
 app = Flask(__name__)
-ros_ready = threading.Event()
 
-# --- Queues for Latest Topic Data ---
-data_queues = {
-    'odometry': queue.Queue(maxsize=1),
-    'imu': queue.Queue(maxsize=1),
-    'navsat_fix': queue.Queue(maxsize=1),
-    'navsat_vel': queue.Queue(maxsize=1),
-    'feedback': queue.Queue(maxsize=1),
-    'status': queue.Queue(maxsize=1),
+# Shared state for telemetry
+telemetry_state = {
+    "odometry": None,
+    "imu": None,
+    "navsat_fix": None,
+    "navsat_vel": None,
+    "feedback": None,
+    "status": None
 }
+telemetry_lock = threading.Lock()
 
-def put_latest(q, data):
-    try:
-        if q.full():
-            q.get_nowait()
-    except queue.Empty:
-        pass
-    q.put(data)
+# --- ROS Callbacks ---
+def odom_callback(msg):
+    with telemetry_lock:
+        telemetry_state["odometry"] = rosmsg_to_dict(msg)
 
-# --- ROS Subscriber Callbacks ---
-def odometry_cb(msg):
-    put_latest(data_queues['odometry'], msg)
+def imu_callback(msg):
+    with telemetry_lock:
+        telemetry_state["imu"] = rosmsg_to_dict(msg)
 
-def imu_cb(msg):
-    put_latest(data_queues['imu'], msg)
+def navsat_fix_callback(msg):
+    with telemetry_lock:
+        telemetry_state["navsat_fix"] = rosmsg_to_dict(msg)
 
-def navsat_fix_cb(msg):
-    put_latest(data_queues['navsat_fix'], msg)
+def navsat_vel_callback(msg):
+    with telemetry_lock:
+        telemetry_state["navsat_vel"] = rosmsg_to_dict(msg)
 
-def navsat_vel_cb(msg):
-    put_latest(data_queues['navsat_vel'], msg)
+def feedback_callback(msg):
+    with telemetry_lock:
+        telemetry_state["feedback"] = rosmsg_to_dict(msg)
 
-def feedback_cb(msg):
-    put_latest(data_queues['feedback'], msg)
+def status_callback(msg):
+    with telemetry_lock:
+        telemetry_state["status"] = rosmsg_to_dict(msg)
 
-def status_cb(msg):
-    put_latest(data_queues['status'], msg)
-
-def ros_thread():
-    rospy.init_node('jackal_ugv_http_driver', anonymous=True, disable_signals=True)
-    rospy.Subscriber('/odometry/filtered', Odometry, odometry_cb)
-    rospy.Subscriber('/imu/data', Imu, imu_cb)
-    rospy.Subscriber('/navsat/fix', NavSatFix, navsat_fix_cb)
-    rospy.Subscriber('/navsat/vel', Twist, navsat_vel_cb)
-    rospy.Subscriber('/feed_back', Feedback, feedback_cb)
-    rospy.Subscriber('/status', Status, status_cb)
-    global cmd_vel_pub, cmd_driver_pub
-    cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=1)
-    cmd_driver_pub = rospy.Publisher('/cmd_driver', Drive, queue_size=1)
-    ros_ready.set()
-    rospy.spin()
-
-ros_bg_thread = threading.Thread(target=ros_thread, daemon=True)
-ros_bg_thread.start()
-ros_ready.wait(timeout=15)
-
-def ros_to_dict(msg):
-    # Recursively convert ROS message to dict
+def rosmsg_to_dict(msg):
+    # Recursively convert ROS message to Python dictionary
     if hasattr(msg, '__slots__'):
         result = {}
         for slot in msg.__slots__:
-            val = getattr(msg, slot)
-            result[slot] = ros_to_dict(val)
+            attr = getattr(msg, slot)
+            if isinstance(attr, (list, tuple)):
+                result[slot] = [rosmsg_to_dict(a) if hasattr(a, '__slots__') else a for a in attr]
+            elif hasattr(attr, '__slots__'):
+                result[slot] = rosmsg_to_dict(attr)
+            else:
+                result[slot] = attr
         return result
-    elif isinstance(msg, (list, tuple)):
-        return [ros_to_dict(x) for x in msg]
-    elif isinstance(msg, (float, int, str, bool)):
-        return msg
     else:
-        return str(msg)
+        return msg
 
-def get_latest(q):
-    try:
-        return q.queue[-1]
-    except (IndexError, AttributeError):
-        return None
+def ros_thread():
+    rospy.init_node('jackal_http_driver', anonymous=True, disable_signals=True)
+    rospy.Subscriber(ODOM_TOPIC, Odometry, odom_callback)
+    rospy.Subscriber(IMU_TOPIC, Imu, imu_callback)
+    rospy.Subscriber(NAVSAT_FIX_TOPIC, NavSatFix, navsat_fix_callback)
+    rospy.Subscriber(NAVSAT_VEL_TOPIC, Twist, navsat_vel_callback)
+    rospy.Subscriber(FEEDBACK_TOPIC, Feedback, feedback_callback)
+    rospy.Subscriber(STATUS_TOPIC, Status, status_callback)
+    rospy.spin()
 
-# --- API Endpoints ---
+# Publisher queues
+publisher_queues = {
+    "cmd_vel": queue.Queue(),
+    "cmd_driver": queue.Queue()
+}
 
-@app.route('/move', methods=['POST'])
+def ros_publishers_thread():
+    pub_vel = rospy.Publisher(CMD_VEL_TOPIC, Twist, queue_size=5)
+    pub_driver = rospy.Publisher(CMD_DRIVER_TOPIC, Drive, queue_size=5)
+    rate = rospy.Rate(20)
+    while not rospy.is_shutdown():
+        try:
+            while not publisher_queues["cmd_vel"].empty():
+                twist_msg = publisher_queues["cmd_vel"].get_nowait()
+                pub_vel.publish(twist_msg)
+            while not publisher_queues["cmd_driver"].empty():
+                drive_msg = publisher_queues["cmd_driver"].get_nowait()
+                pub_driver.publish(drive_msg)
+        except Exception:
+            pass
+        rate.sleep()
+
+# ==== HTTP API ====
+
+@app.route("/move", methods=["POST"])
 def move():
-    ros_ready.wait(timeout=5)
+    """
+    Send velocity commands to the UGV (maps to /cmd_vel).
+    Payload: {"linear": {"x": float, "y": float, "z": float}, "angular": {"x": float, "y": float, "z": float}}
+    """
     data = request.get_json(force=True)
-    try:
-        linear = data.get('linear', {})
-        angular = data.get('angular', {})
-        twist = Twist()
-        twist.linear.x = float(linear.get('x', 0))
-        twist.linear.y = float(linear.get('y', 0))
-        twist.linear.z = float(linear.get('z', 0))
-        twist.angular.x = float(angular.get('x', 0))
-        twist.angular.y = float(angular.get('y', 0))
-        twist.angular.z = float(angular.get('z', 0))
-        cmd_vel_pub.publish(twist)
-        return jsonify({"result": "success"}), 200
-    except Exception as e:
-        return jsonify({"result": "error", "reason": str(e)}), 400
+    twist = Twist()
+    lin = data.get("linear", {})
+    ang = data.get("angular", {})
+    twist.linear.x = float(lin.get("x", 0))
+    twist.linear.y = float(lin.get("y", 0))
+    twist.linear.z = float(lin.get("z", 0))
+    twist.angular.x = float(ang.get("x", 0))
+    twist.angular.y = float(ang.get("y", 0))
+    twist.angular.z = float(ang.get("z", 0))
+    publisher_queues["cmd_vel"].put(twist)
+    return jsonify({"status": "OK", "sent": rosmsg_to_dict(twist)})
 
-@app.route('/drive', methods=['POST'])
+@app.route("/drive", methods=["POST"])
 def drive():
-    ros_ready.wait(timeout=5)
+    """
+    Issue low-level driver commands (maps to /cmd_driver).
+    Payload: see jackal_msgs/Drive fields
+    """
     data = request.get_json(force=True)
-    try:
-        drive_msg = Drive()
-        # Allow generic mapping: all Drive fields can be set by JSON keys
-        for field in drive_msg.__slots__:
-            if field in data:
-                setattr(drive_msg, field, data[field])
-        cmd_driver_pub.publish(drive_msg)
-        return jsonify({"result": "success"}), 200
-    except Exception as e:
-        return jsonify({"result": "error", "reason": str(e)}), 400
+    drive_msg = Drive()
+    for slot in drive_msg.__slots__:
+        if slot in data:
+            setattr(drive_msg, slot, data[slot])
+    publisher_queues["cmd_driver"].put(drive_msg)
+    return jsonify({"status": "OK", "sent": rosmsg_to_dict(drive_msg)})
 
-@app.route('/telemetry', methods=['GET'])
+@app.route("/telemetry", methods=["GET"])
 def telemetry():
-    ros_ready.wait(timeout=5)
-    telemetry_data = {}
-    odom = get_latest(data_queues['odometry'])
-    imu = get_latest(data_queues['imu'])
-    navsat_fix = get_latest(data_queues['navsat_fix'])
-    navsat_vel = get_latest(data_queues['navsat_vel'])
-    feedback = get_latest(data_queues['feedback'])
-    status = get_latest(data_queues['status'])
-    telemetry_data['odometry'] = ros_to_dict(odom) if odom else None
-    telemetry_data['imu'] = ros_to_dict(imu) if imu else None
-    telemetry_data['navsat_fix'] = ros_to_dict(navsat_fix) if navsat_fix else None
-    telemetry_data['navsat_vel'] = ros_to_dict(navsat_vel) if navsat_vel else None
-    telemetry_data['feedback'] = ros_to_dict(feedback) if feedback else None
-    telemetry_data['status'] = ros_to_dict(status) if status else None
-    return jsonify(telemetry_data), 200
+    """
+    Retrieve aggregated telemetry from all main topics.
+    """
+    with telemetry_lock:
+        snapshot = dict(telemetry_state)
+    return Response(json.dumps(snapshot, default=str), mimetype="application/json")
 
-if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+def main():
+    # Start ROS thread
+    rt = threading.Thread(target=ros_thread, daemon=True)
+    rt.start()
+    pt = threading.Thread(target=ros_publishers_thread, daemon=True)
+    pt.start()
+    # Wait for ROS node to be ready
+    while not rospy.core.is_initialized():
+        time.sleep(0.2)
+    # Start HTTP server
+    app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
+
+if __name__ == "__main__":
+    main()
