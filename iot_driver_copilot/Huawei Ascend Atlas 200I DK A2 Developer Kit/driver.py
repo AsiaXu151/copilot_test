@@ -2,181 +2,217 @@ import os
 import io
 import threading
 import time
+import base64
 from flask import Flask, request, jsonify, Response, send_file
 import serial
+import serial.tools.list_ports
 import yaml
-import tempfile
 
-# ========== Configuration from environment variables ==========
-SERVER_HOST = os.environ.get("DRIVER_HTTP_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("DRIVER_HTTP_PORT", "8080"))
+# ENVIRONMENT VARIABLES
+HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
+SERIAL_PORT = os.environ.get("SERIAL_PORT", "/dev/ttyUSB0")
+SERIAL_BAUDRATE = int(os.environ.get("SERIAL_BAUDRATE", "115200"))
+SERIAL_TIMEOUT = float(os.environ.get("SERIAL_TIMEOUT", "1.0"))
+MAP_DIR = os.environ.get("MAP_DIR", "./maps")
+FIRMWARE_UPLOAD_DIR = os.environ.get("FIRMWARE_UPLOAD_DIR", "./firmware")
 
-# Serial/UART configuration for LIDAR (example values, override with env vars if needed)
-LIDAR_SERIAL_PORT = os.environ.get("LIDAR_SERIAL_PORT", "/dev/ttyUSB0")
-LIDAR_BAUDRATE = int(os.environ.get("LIDAR_BAUDRATE", "115200"))
+# Ensure directories exist
+os.makedirs(MAP_DIR, exist_ok=True)
+os.makedirs(FIRMWARE_UPLOAD_DIR, exist_ok=True)
 
-# Path for temporary map files
-MAP_SAVE_DIR = os.environ.get("MAP_SAVE_DIR", "/tmp")
-
-# ========== Global State ==========
-lidar_thread = None
-lidar_running = False
-lidar_data_buffer = []
-lidar_lock = threading.Lock()
-map_files = {}
-teleop_last_cmd = None
-
-# ========== LIDAR Serial Communication ==========
-def read_lidar_serial():
-    global lidar_running, lidar_data_buffer
-    try:
-        with serial.Serial(LIDAR_SERIAL_PORT, LIDAR_BAUDRATE, timeout=1) as ser:
-            while lidar_running:
-                line = ser.readline()
-                if line:
-                    with lidar_lock:
-                        lidar_data_buffer.append(line)
-                        # Keep buffer size reasonable
-                        if len(lidar_data_buffer) > 1000:
-                            lidar_data_buffer = lidar_data_buffer[-1000:]
-    except Exception as e:
-        with lidar_lock:
-            lidar_data_buffer.append(b"ERROR: " + str(e).encode())
-
-def start_lidar():
-    global lidar_running, lidar_thread, lidar_data_buffer
-    if lidar_running:
-        return
-    lidar_data_buffer = []
-    lidar_running = True
-    lidar_thread = threading.Thread(target=read_lidar_serial, daemon=True)
-    lidar_thread.start()
-
-def stop_lidar():
-    global lidar_running, lidar_thread
-    lidar_running = False
-    if lidar_thread:
-        lidar_thread.join(timeout=2)
-        lidar_thread = None
-
-# ========== Flask HTTP API ==========
 app = Flask(__name__)
 
-@app.route("/map/launch", methods=["POST"])
-def map_launch():
-    # Simulate map building from lidar data
-    if not lidar_running:
-        return jsonify({"error": "LIDAR is not running"}), 400
-    # For demo: Save fake map files
-    pgm_path = os.path.join(MAP_SAVE_DIR, "map.pgm")
-    yaml_path = os.path.join(MAP_SAVE_DIR, "map.yaml")
-    with open(pgm_path, "wb") as f:
-        f.write(b"P5\n# Demo map\n10 10\n255\n" + b"\x80" * 100)
-    with open(yaml_path, "w") as f:
-        yaml.dump({"image": "map.pgm", "resolution": 0.05, "origin": [0,0,0]}, f)
-    map_files['pgm'] = pgm_path
-    map_files['yaml'] = yaml_path
-    return jsonify({"status": "mapping launched", "map_files": ["map.pgm", "map.yaml"]})
+# SERIAL CONNECTION MANAGEMENT
+serial_lock = threading.Lock()
+serial_conn = None
 
-@app.route("/lidar/start", methods=["POST"])
+def get_serial_connection():
+    global serial_conn
+    if serial_conn is None or not serial_conn.is_open:
+        serial_conn = serial.Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=SERIAL_TIMEOUT)
+    return serial_conn
+
+def send_serial_command(command, expect_response=True, response_timeout=2):
+    with serial_lock:
+        conn = get_serial_connection()
+        conn.write((command + '\n').encode('utf-8'))
+        if expect_response:
+            conn.flush()
+            deadline = time.time() + response_timeout
+            lines = []
+            while time.time() < deadline:
+                line = conn.readline()
+                if line:
+                    lines.append(line.decode('utf-8').strip())
+                else:
+                    break
+            return '\n'.join(lines)
+        return None
+
+# LIDAR DATA STREAMING
+lidar_streaming = False
+lidar_data_buffer = []
+lidar_thread = None
+
+def lidar_data_reader():
+    global lidar_streaming, lidar_data_buffer
+    while lidar_streaming:
+        response = send_serial_command("GET_LIDAR_SCAN", expect_response=True, response_timeout=0.2)
+        if response:
+            lidar_data_buffer.append(response)
+            if len(lidar_data_buffer) > 100:
+                lidar_data_buffer = lidar_data_buffer[-100:]
+        time.sleep(0.1)
+
+@app.route('/lidar/start', methods=['POST'])
 def lidar_start():
-    start_lidar()
-    return jsonify({"status": "LIDAR started"})
+    global lidar_streaming, lidar_thread
+    if not lidar_streaming:
+        resp = send_serial_command("LIDAR_START", expect_response=True)
+        lidar_streaming = True
+        lidar_thread = threading.Thread(target=lidar_data_reader, daemon=True)
+        lidar_thread.start()
+        return jsonify({"status": "LIDAR started", "device_response": resp})
+    else:
+        return jsonify({"status": "LIDAR already running"})
 
-@app.route("/lidar/stop", methods=["POST"])
+@app.route('/lidar/stop', methods=['POST'])
 def lidar_stop():
-    stop_lidar()
-    return jsonify({"status": "LIDAR stopped"})
+    global lidar_streaming
+    if lidar_streaming:
+        resp = send_serial_command("LIDAR_STOP", expect_response=True)
+        lidar_streaming = False
+        return jsonify({"status": "LIDAR stopped", "device_response": resp})
+    else:
+        return jsonify({"status": "LIDAR not running"})
 
-@app.route("/lidar/stream", methods=["GET"])
+@app.route('/lidar/stream', methods=['GET'])
 def lidar_stream():
-    def stream():
-        last_idx = 0
-        while lidar_running:
-            time.sleep(0.1)
-            with lidar_lock:
-                if last_idx < len(lidar_data_buffer):
-                    data = lidar_data_buffer[last_idx:]
-                    last_idx = len(lidar_data_buffer)
-                    for line in data:
-                        yield b"data: " + line.strip() + b"\n\n"
-    if not lidar_running:
+    def generate():
+        last_index = 0
+        while lidar_streaming:
+            if last_index < len(lidar_data_buffer):
+                data = lidar_data_buffer[last_index]
+                last_index += 1
+                yield f"data: {data}\n\n"
+            else:
+                time.sleep(0.1)
+    if not lidar_streaming:
         return jsonify({"error": "LIDAR is not running"}), 400
-    return Response(stream(), mimetype="text/event-stream")
+    return Response(generate(), content_type='text/event-stream')
 
-@app.route("/teleop", methods=["POST"])
-def teleop():
-    global teleop_last_cmd
-    cmd = request.get_json(force=True)
-    teleop_last_cmd = cmd
-    # Here you would send the command to the Arduino over serial (not implemented)
-    return jsonify({"status": "teleop command sent", "command": cmd})
+# MAP GENERATION & SAVING
 
-@app.route("/nav/launch", methods=["POST"])
-def nav_launch():
-    # Simulate navigation node activation
-    return jsonify({"status": "navigation launched"})
+mapping_active = False
+generated_map = None  # Simulation: {'pgm': bytes, 'yaml': str}
 
-@app.route("/map/save", methods=["POST"])
+@app.route('/map/launch', methods=['POST'])
+def map_launch():
+    global mapping_active, generated_map
+    if not mapping_active:
+        mapping_active = True
+        # Simulate map generation (replace with real device code)
+        # Here, send mapping start command
+        resp = send_serial_command("MAP_LAUNCH", expect_response=True)
+        # Simulate map files
+        generated_map = {
+            'pgm': b'P5\n# Simulated map\n10 10\n255\n' + bytes([255]*100),
+            'yaml': yaml.dump({'image': 'map.pgm', 'resolution': 0.05, 'origin': [0,0,0], 'negate': 0, 'occupied_thresh': 0.65, 'free_thresh': 0.196})
+        }
+        return jsonify({"status": "Mapping started", "device_response": resp})
+    else:
+        return jsonify({"status": "Mapping already active"})
+
+@app.route('/map/save', methods=['POST'])
 def map_save():
-    if 'pgm' not in map_files or 'yaml' not in map_files:
-        return jsonify({"error": "No map to save"}), 400
-    # For demo, just confirm the files exist
-    return jsonify({"status": "map saved", "files": [map_files['pgm'], map_files['yaml']]})
+    global mapping_active, generated_map
+    if generated_map is None:
+        return jsonify({"error": "No generated map to save"}), 404
+    timestamp = int(time.time())
+    pgm_path = os.path.join(MAP_DIR, f"map_{timestamp}.pgm")
+    yaml_path = os.path.join(MAP_DIR, f"map_{timestamp}.yaml")
+    with open(pgm_path, 'wb') as f:
+        f.write(generated_map['pgm'])
+    with open(yaml_path, 'w') as f:
+        f.write(generated_map['yaml'])
+    mapping_active = False
+    return jsonify({"status": "Map saved", "pgm_file": pgm_path, "yaml_file": yaml_path})
 
-@app.route("/loc/launch", methods=["POST"])
+@app.route('/map/files', methods=['GET'])
+def list_map_files():
+    files = [f for f in os.listdir(MAP_DIR) if f.endswith('.pgm') or f.endswith('.yaml')]
+    return jsonify({"map_files": files})
+
+@app.route('/map/files/<filename>', methods=['GET'])
+def get_map_file(filename):
+    filepath = os.path.join(MAP_DIR, filename)
+    if os.path.isfile(filepath):
+        return send_file(filepath)
+    else:
+        return jsonify({"error": "File not found"}), 404
+
+# NAVIGATION
+
+@app.route('/nav/launch', methods=['POST'])
+def nav_launch():
+    resp = send_serial_command("NAV_LAUNCH", expect_response=True)
+    return jsonify({"status": "Navigation launched", "device_response": resp})
+
+# LOCALIZATION
+
+@app.route('/loc/launch', methods=['POST'])
 def loc_launch():
-    # Simulate localization process
-    return jsonify({"status": "localization launched"})
+    resp = send_serial_command("LOC_LAUNCH", expect_response=True)
+    return jsonify({"status": "Localization launched", "device_response": resp})
 
-@app.route("/firmware", methods=["POST"])
+# TELEOPERATION
+
+@app.route('/teleop', methods=['POST'])
+def teleop():
+    # Expecting JSON: { "linear": x, "angular": y }
+    cmd = request.json
+    if not cmd or 'linear' not in cmd or 'angular' not in cmd:
+        return jsonify({"error": "Invalid teleop command"}), 400
+    command_str = f"TELEOP {cmd['linear']} {cmd['angular']}"
+    resp = send_serial_command(command_str, expect_response=True)
+    return jsonify({"status": "Teleop command sent", "device_response": resp})
+
+# FIRMWARE UPLOAD
+
+@app.route('/firmware', methods=['POST'])
 def firmware_upload():
     if 'file' not in request.files:
-        return jsonify({"error": "No firmware file uploaded"}), 400
-    fw = request.files['file']
-    fw_path = os.path.join(MAP_SAVE_DIR, fw.filename)
-    fw.save(fw_path)
-    # Actual firmware flashing not implemented for safety
-    return jsonify({"status": "firmware uploaded", "file": fw.filename})
+        return jsonify({"error": "No file uploaded"}), 400
+    file = request.files['file']
+    filename = file.filename
+    if not filename:
+        return jsonify({"error": "No filename specified"}), 400
+    save_path = os.path.join(FIRMWARE_UPLOAD_DIR, filename)
+    file.save(save_path)
+    # Simulate firmware flash
+    resp = send_serial_command(f"FIRMWARE_UPLOAD {save_path}", expect_response=True)
+    return jsonify({"status": "Firmware uploaded", "filename": filename, "device_response": resp})
 
-@app.route("/map/pgm", methods=["GET"])
-def get_map_pgm():
-    if 'pgm' not in map_files:
-        return jsonify({"error": "No map available"}), 404
-    return send_file(map_files['pgm'], mimetype="image/x-portable-graymap")
-
-@app.route("/map/yaml", methods=["GET"])
-def get_map_yaml():
-    if 'yaml' not in map_files:
-        return jsonify({"error": "No map available"}), 404
-    return send_file(map_files['yaml'], mimetype="text/yaml")
-
-@app.route("/lidar/raw", methods=["GET"])
-def lidar_raw():
-    # Returns last 100 lines of raw LIDAR data in plain text
-    with lidar_lock:
-        lines = lidar_data_buffer[-100:]
-    return Response(b"".join(lines), mimetype="text/plain")
-
-@app.route("/")
-def index():
-    return """
-    <h1>Huawei Atlas 200I DK A2 LIDAR/Robot HTTP Driver</h1>
-    <ul>
-        <li>POST /lidar/start</li>
-        <li>POST /lidar/stop</li>
-        <li>GET  /lidar/stream (SSE, browser/CLI)</li>
-        <li>GET  /lidar/raw (raw text)</li>
-        <li>POST /map/launch</li>
-        <li>GET  /map/pgm</li>
-        <li>GET  /map/yaml</li>
-        <li>POST /map/save</li>
-        <li>POST /nav/launch</li>
-        <li>POST /loc/launch</li>
-        <li>POST /teleop (JSON body)</li>
-        <li>POST /firmware (multipart form-data)</li>
-    </ul>
-    """
+# ROOT
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({
+        "device": "Huawei Ascend Atlas 200I DK A2 Developer Kit",
+        "api": [
+            {"method": "POST", "path": "/map/launch", "description": "Launch mapping process"},
+            {"method": "POST", "path": "/lidar/start", "description": "Start LIDAR sensor"},
+            {"method": "POST", "path": "/lidar/stop", "description": "Stop LIDAR sensor"},
+            {"method": "GET",  "path": "/lidar/stream", "description": "HTTP event stream of LIDAR data"},
+            {"method": "POST", "path": "/teleop", "description": "Manual teleop control"},
+            {"method": "POST", "path": "/nav/launch", "description": "Launch navigation nodes"},
+            {"method": "POST", "path": "/map/save", "description": "Save map to file"},
+            {"method": "GET",  "path": "/map/files", "description": "List generated map files"},
+            {"method": "GET",  "path": "/map/files/<filename>", "description": "Get a map file"},
+            {"method": "POST", "path": "/loc/launch", "description": "Start localization"},
+            {"method": "POST", "path": "/firmware", "description": "Upload firmware to device"}
+        ]
+    })
 
 if __name__ == "__main__":
-    app.run(host=SERVER_HOST, port=SERVER_PORT)
+    app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True)
